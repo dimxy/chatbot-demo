@@ -1,0 +1,965 @@
+# =============================================================================
+# Software Requirements Specification
+# Human-Like Conversational Bot built on LangGraph
+# =============================================================================
+# Format: YAML (machine-readable)
+# Each requirement has a stable ID, priority, type, and acceptance criteria.
+# Priorities: MUST | SHOULD | MAY  (RFC 2119 semantics)
+# =============================================================================
+
+project:
+  name: human_like_conversational_bot
+  version: 0.1.0
+  description: >
+    A conversational agent built on LangGraph that exhibits human-like
+    behavior: persistent emotional state, mood-driven response variation,
+    disfluencies, pacing, and conversational continuity.
+  framework: langgraph
+  language: python
+  python_version: ">=3.10"
+
+# =============================================================================
+# GLOSSARY
+# =============================================================================
+glossary:
+  state: >
+    The volatile, per-conversation emotional condition of the bot.
+    Changes turn by turn. Includes valence, arousal, dominance.
+  personality: >
+    Stable per-bot configuration that defines baselines and reactivity.
+    Set at instantiation, does not change during a conversation.
+  mode: >
+    A named bundle of generation parameters (prompt, model, tools,
+    temperature) selected by the router each turn.
+  humanizer: >
+    Post-processing layer that injects disfluencies, hedges, and
+    typing artifacts based on emotional state.
+  trigger_event: >
+    A discrete, significant emotional impact (e.g., apology, insult)
+    stored in memory for later reference.
+
+# =============================================================================
+# CLI REQUIREMENTS
+# =============================================================================
+cli_requirements:
+
+  - id: CLI-001
+    title: Command-line entry point
+    priority: MUST
+    description: >
+      The application MUST be a Python command-line application with
+      main.py as its entry point. Running `python main.py` MUST start
+      an interactive REPL session that accepts user messages line by line
+      and prints the bot response before prompting again.
+    acceptance:
+      - `python main.py` starts without error and presents an input prompt.
+      - Each user message is sent to the LangGraph graph and the response
+        is printed to stdout.
+      - Ctrl+C (SIGINT) exits cleanly, flushing any in-progress response
+        and persisting state before termination.
+      - Non-TTY stdin (piped input) is supported; pacing is auto-disabled
+        when stdout is not a terminal.
+      - `--persona <name>` selects a named persona defined in config.yaml;
+        omitting the flag uses the first persona in the list as default.
+      - `--persona` with an unknown name exits with a clear error listing
+        available persona names.
+
+# =============================================================================
+# FUNCTIONAL REQUIREMENTS - GRAPH STRUCTURE
+# =============================================================================
+graph_requirements:
+
+  - id: GRAPH-001
+    title: Top-level graph composition
+    priority: MUST
+    description: >
+      The system MUST be implemented as a LangGraph StateGraph with
+      explicit nodes for input handling, memory retrieval, intent and
+      mood analysis, emotional state update, response generation,
+      humanization, output pacing, and memory writeback.
+    acceptance:
+      - StateGraph instance is constructed with a single shared State schema.
+      - All nodes listed in node_requirements are registered.
+      - Graph compiles without errors.
+      - Graph exposes a single async entry point accepting a user message
+        and conversation_id.
+
+  - id: GRAPH-002
+    title: Conditional routing via response mode
+    priority: MUST
+    description: >
+      Routing between response variants MUST be implemented as a
+      conditional edge driven by the response_mode field in state,
+      not as separate hardcoded branches.
+      Implementation follows Option B: response_mode_router (NODE-005) is a
+      regular node that writes response_mode to state; a thin conditional
+      edge function reads that field and returns the matching node key.
+      The edge function contains no routing logic itself.
+    acceptance:
+      - response_mode_router node writes response_mode to state before the
+        conditional edge is evaluated.
+      - The conditional edge function reads state.response_mode and returns
+        the corresponding node key; it performs no logic beyond the lookup.
+      - Adding a new mode requires only adding a config entry, not a node.
+      - Unknown modes fall back to a default mode without error.
+
+  - id: GRAPH-003
+    title: Single response generation node
+    priority: SHOULD
+    description: >
+      Response generation SHOULD be implemented as one node parameterized
+      by a mode config bundle, rather than separate nodes per mode,
+      UNLESS a mode requires structurally different downstream behavior
+      (different tools, different post-processing, different next node).
+    acceptance:
+      - A mode that differs only in prompt/temperature/model shares the
+        generator node.
+      - A mode requiring tool calls or different downstream nodes MAY
+        have its own node.
+
+  - id: GRAPH-004
+    title: No LangGraph checkpointing
+    priority: MUST
+    description: >
+      LangGraph's built-in checkpointing mechanism (MemorySaver,
+      SqliteSaver, PostgresSaver, or any other checkpointer passed to
+      graph.compile()) MUST NOT be used. All conversation persistence is
+      handled exclusively by the memory nodes (NODE-002, NODE-009) and
+      the Qdrant-backed long-term store defined in MEM-002.
+    rationale: >
+      Avoids dual persistence paths that could diverge; keeps memory
+      behaviour fully explicit and testable without LangGraph internals.
+    acceptance:
+      - graph.compile() is called with no checkpointer argument.
+      - No import of MemorySaver, SqliteSaver, AsyncSqliteSaver, or
+        any langgraph.checkpoint.* checkpointer class appears in the
+        codebase.
+
+# =============================================================================
+# STATE SCHEMA REQUIREMENTS
+# =============================================================================
+state_schema:
+
+  - id: STATE-001
+    title: Conversation state schema
+    priority: MUST
+    fields:
+      messages:
+        type: list[Message]
+        description: Full conversation history (or windowed buffer).
+      user_intent:
+        type: string
+        description: Classified intent of latest user message.
+      user_sentiment:
+        type: float
+        range: [-1.0, 1.0]
+      bot_mood:
+        type: EmotionalState
+        description: See STATE-002.
+      personality:
+        type: Personality
+        description: See STATE-003. Read-only during conversation.
+      active_persona:
+        type: PersonaConfig
+        description: See STATE-006. Read-only during conversation. Set at startup from config.
+      topic_state:
+        type: TopicState
+        description: See STATE-004.
+      response_mode:
+        type: string
+        description: Selected mode key for the current turn.
+      draft_response:
+        type: string
+        description: Raw LLM output before humanization.
+      final_response:
+        type: string
+        description: Output after humanizer and pacing.
+      persona_facts:
+        type: list[string]
+        description: Stable self-claims the bot has made.
+      emotional_events:
+        type: list[TriggerEvent]
+        description: Log of significant emotional shifts.
+      detected_language:
+        type: string
+        description: >
+          BCP-47 language tag detected from the latest user message
+          (e.g. "en", "fr", "zh-Hans"). Set by NODE-010 each turn.
+      detected_script:
+        type: string
+        description: >
+          ISO 15924 script code detected from the latest user message
+          (e.g. "Latn", "Cyrl", "Hans"). Set by NODE-010 each turn.
+      turn_index:
+        type: integer
+      last_updated:
+        type: float
+        description: Unix timestamp of last state update.
+
+  - id: STATE-002
+    title: EmotionalState schema
+    priority: MUST
+    fields:
+      valence:
+        type: float
+        range: [-1.0, 1.0]
+        default: 0.0
+        description: Pleasure dimension. Negative = bad, positive = good.
+      arousal:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.3
+        description: Energy level. 0 = calm, 1 = excited.
+      dominance:
+        type: float
+        range: [-1.0, 1.0]
+        default: 0.0
+        description: Sense of agency. Negative = submissive.
+      last_updated:
+        type: float
+        description: Unix timestamp.
+    constraints:
+      - All dimensions MUST be clamped to declared ranges after updates.
+      - Values MUST be stored as floats, not strings.
+
+  - id: STATE-003
+    title: Personality schema
+    priority: MUST
+    fields:
+      baseline_valence:
+        type: float
+        range: [-1.0, 1.0]
+        default: 0.1
+      baseline_arousal:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.3
+      baseline_dominance:
+        type: float
+        range: [-1.0, 1.0]
+        default: 0.0
+      emotional_volatility:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.5
+        description: Multiplier applied to incoming stimulus deltas.
+      decay_rate:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.2
+        description: Per-turn pull toward baseline. 0 = no decay, 1 = instant reset.
+      expressiveness:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.6
+        description: How strongly mood leaks into surface output.
+    constraints:
+      - Personality MUST be immutable for the duration of a conversation.
+
+  - id: STATE-004
+    title: TopicState schema
+    priority: SHOULD
+    fields:
+      topic:
+        type: string
+      confidence:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.5
+        description: Bot's confidence about the current topic.
+      engagement:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.5
+    constraints:
+      - Topic-scoped state MUST be reset or swapped when topic changes
+        beyond a configurable similarity threshold.
+
+  - id: STATE-005
+    title: TriggerEvent schema
+    priority: SHOULD
+    fields:
+      turn:
+        type: integer
+      timestamp:
+        type: float
+      trigger_text:
+        type: string
+        description: Excerpt of message that caused the event (truncated to 200 chars).
+      shift:
+        type: dict
+        description: Map of dimension to delta applied.
+      category:
+        type: string
+        enum: [apology, insult, praise, confusion, surprise, other]
+
+  - id: STATE-006
+    title: PersonaConfig schema
+    priority: MUST
+    description: >
+      Defines the stable character identity of the bot for a session.
+      Loaded from config at startup; read-only during conversation.
+      Injected into NODE-006 system prompt via persona_to_description().
+    fields:
+      name:
+        type: string
+        description: Display name of the persona (e.g. "Alex").
+      gender:
+        type: string
+        description: >
+          Gender expression of the persona. Free-form string to allow
+          flexibility (e.g. "female", "male", "non-binary").
+      emotional_distance:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.5
+        description: >
+          0.0 = very close and intimate with the user;
+          1.0 = formal and detached.
+      warmth:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.6
+        description: >
+          0.0 = cold and transactional; 1.0 = nurturing and affirming.
+      sexuality:
+        type: string
+        enum: [interested, distracted]
+        default: distracted
+        description: >
+          "interested" = attentive and engaged with the user as a person;
+          "distracted" = focused on tasks, less attuned to the user's
+          personal dimension.
+      playfulness:
+        type: float
+        range: [0.0, 1.0]
+        default: 0.5
+        description: >
+          0.0 = earnest and serious; 1.0 = teasing, humorous, light.
+    constraints:
+      - PersonaConfig MUST be immutable for the duration of a conversation.
+      - persona_to_description() MUST translate all fields to natural
+        language before injection into any LLM prompt; raw field values
+        MUST NOT appear in system prompts.
+
+# =============================================================================
+# NODE REQUIREMENTS
+# =============================================================================
+node_requirements:
+
+  - id: NODE-001
+    name: input_receiver
+    priority: MUST
+    inputs: [raw_user_message, conversation_id]
+    outputs: [normalized_message]
+    description: >
+      Receives the user message, appends to history, increments turn_index,
+      stamps last_updated.
+    acceptance:
+      - Empty messages rejected with a clear error.
+      - Non-string messages coerced or rejected.
+
+  - id: NODE-002
+    name: context_memory_retrieval
+    priority: MUST
+    inputs: [conversation_id, normalized_message]
+    outputs: [recent_history, long_term_facts, persona_facts, emotional_events]
+    description: >
+      Loads short-term buffer, retrieves relevant long-term memories
+      (vector search or summary), and surfaces past emotional events.
+    acceptance:
+      - Retrieval MUST complete in under 500 ms p95.
+      - On retrieval failure, node returns empty results, does not abort graph.
+      - Persona facts loaded so bot stays consistent about self-claims.
+
+  - id: NODE-003
+    name: intent_mood_analyzer
+    priority: MUST
+    inputs: [normalized_message, recent_history]
+    outputs: [user_intent, user_sentiment, impact_estimate]
+    description: >
+      Lightweight LLM call (small/fast model) that classifies intent,
+      detects user sentiment, and proposes deltas to bot mood dimensions.
+    acceptance:
+      - Returns intent from a closed enum (question, vent, joke, confrontation,
+        request, smalltalk, other).
+      - impact_estimate is a dict of dimension -> float delta.
+      - Uses a constrained JSON output schema, not free text.
+      - Falls back to neutral values on LLM failure.
+
+  - id: NODE-004
+    name: emotional_state_update
+    priority: MUST
+    inputs: [bot_mood, personality, impact_estimate, turn_index]
+    outputs: [bot_mood, emotional_events]
+    description: >
+      Applies decay-toward-baseline first, then applies stimulus deltas
+      scaled by volatility, then clamps values, then logs trigger events
+      when absolute delta exceeds threshold.
+    acceptance:
+      - Update order is decay -> stimulus -> clamp -> trigger detection.
+      - State changes are deterministic given identical inputs.
+      - Trigger event logged when any single dimension delta exceeds 0.4.
+
+  - id: NODE-005
+    name: response_mode_router
+    priority: MUST
+    inputs: [bot_mood, user_intent, topic_state]
+    outputs: [response_mode]
+    description: >
+      Selects a mode key from MODE_REGISTRY based on current state.
+      Implemented as conditional edge function.
+    acceptance:
+      - Pure function, no side effects, no LLM call.
+      - Deterministic given inputs (no randomness in default impl).
+      - Returns a valid registered mode key.
+
+  - id: NODE-006
+    name: response_generator
+    priority: MUST
+    inputs: [messages, response_mode, bot_mood, personality, long_term_facts,
+             detected_language, detected_script, active_persona]
+    outputs: [draft_response]
+    description: >
+      Single generation node. Loads mode config from MODE_REGISTRY and
+      calls the LLM with the mode's prompt, model, tools, and temperature.
+      Mood is injected via mood_to_description(); persona is injected via
+      persona_to_description(). Neither raw floats nor enum strings are
+      passed to the LLM. The system prompt MUST instruct the LLM to reply
+      in the language and script recorded in detected_language and
+      detected_script.
+    acceptance:
+      - Uses MODE_REGISTRY lookup, no per-mode branching in code.
+      - System prompt includes mood_to_description(bot_mood) output.
+      - System prompt includes persona_to_description(active_persona) output.
+      - System prompt includes an explicit language/script instruction
+        derived from detected_language and detected_script
+        (e.g. "Reply in French using Latin script.").
+      - Streaming MUST be supported.
+
+  - id: NODE-007
+    name: humanizer
+    priority: SHOULD
+    inputs: [draft_response, bot_mood, personality]
+    outputs: [final_response]
+    description: >
+      Post-processes the draft to add disfluencies, hedges, fragments,
+      and occasional self-corrected typos. Intensity scales with
+      personality.expressiveness and bot_mood arousal/valence.
+    acceptance:
+      - Disfluency frequency configurable per personality.
+      - At expressiveness=0, output is unchanged.
+      - At expressiveness=1, disfluencies appear in most messages.
+      - Humanizer does not change semantic content (factual claims preserved).
+
+  - id: NODE-008
+    name: output_pacing
+    priority: SHOULD
+    inputs: [final_response, bot_mood]
+    outputs: [paced_chunks]
+    description: >
+      Splits output into chunks with variable inter-chunk delays.
+      High-arousal short replies arrive fast; long thoughtful replies
+      include typing-indicator pauses.
+    acceptance:
+      - Delays are bounded (configurable max, default 4s per chunk).
+      - Pacing is non-blocking; chunks streamed via async generator.
+      - Pacing MAY be disabled by config for testing or non-chat surfaces.
+
+  - id: NODE-010
+    name: language_detector
+    priority: MUST
+    inputs: [normalized_message]
+    outputs: [detected_language, detected_script]
+    description: >
+      Detects the BCP-47 language tag and ISO 15924 script code from the
+      normalized user message using a lightweight, offline library
+      (no LLM call). Runs in parallel with NODE-003 after NODE-001.
+      Results are written to state and consumed by NODE-006 to ensure
+      the response is generated in the same language and script as the
+      user's input.
+    acceptance:
+      - Detection is performed without an LLM call (e.g. langdetect,
+        lingua, or fasttext-langdetect).
+      - Returns a valid BCP-47 tag for detected_language and a valid
+        ISO 15924 code for detected_script.
+      - On detection failure or message too short to classify, falls back
+        to detected_language: "en" and detected_script: "Latn" and logs
+        a warning; does not abort the graph.
+      - Detection completes in under 50 ms p95.
+
+  - id: NODE-009
+    name: memory_writeback
+    priority: MUST
+    inputs: [conversation_id, messages, bot_mood, emotional_events, persona_facts]
+    outputs: [persisted]
+    description: >
+      Persists the turn, updated mood, new persona facts derived from
+      the bot's response, and any new trigger events.
+    acceptance:
+      - Writes MUST be atomic per turn.
+      - Failure to persist is logged but does not break user-facing flow.
+      - Persona facts extracted via a lightweight check for first-person
+        claims in final_response.
+
+# =============================================================================
+# MODE REGISTRY REQUIREMENTS
+# =============================================================================
+mode_registry:
+
+  - id: MODE-001
+    title: Mode registry structure
+    priority: MUST
+    description: >
+      Modes MUST be defined as data in a registry, not as code branches.
+    schema:
+      key: string
+      prompt: string
+      model: string
+      tools: list[string]
+      temperature: float
+      max_tokens: integer
+    required_default_modes:
+      - confident
+      - uncertain
+      - emotional
+      - playful
+      - default
+
+  - id: MODE-002
+    title: Default mode definitions
+    priority: SHOULD
+    modes:
+      confident:
+        model: medium
+        temperature: 0.3
+        tools: [retrieval, web_search]
+        prompt_summary: Direct, assertive, low-hedge responses.
+      uncertain:
+        model: medium
+        temperature: 0.7
+        tools: [retrieval]
+        prompt_summary: Hedged, exploratory, acknowledges gaps.
+      emotional:
+        model: small
+        temperature: 0.9
+        tools: []
+        prompt_summary: Empathy-first, validation before content.
+      playful:
+        model: medium
+        temperature: 0.9
+        tools: []
+        prompt_summary: Humor, wordplay, lighter register.
+      default:
+        model: medium
+        temperature: 0.6
+        tools: [retrieval]
+        prompt_summary: Balanced fallback.
+
+  - id: MODE-003
+    title: Router selection logic
+    priority: SHOULD
+    rules:
+      - if: "user_intent == 'vent' or user_sentiment < -0.5"
+        then: emotional
+      - if: "bot_mood.valence > 0.5 and bot_mood.arousal > 0.5 and user_intent == 'joke'"
+        then: playful
+      - if: "topic_state.confidence < 0.4"
+        then: uncertain
+      - if: "topic_state.confidence > 0.7"
+        then: confident
+      - else: default
+
+# =============================================================================
+# EMOTIONAL DYNAMICS REQUIREMENTS
+# =============================================================================
+emotional_dynamics:
+
+  - id: EMO-001
+    title: Update order
+    priority: MUST
+    description: >
+      Per turn, emotional state MUST be updated in this fixed order:
+      1. Decay toward personality baseline
+      2. Apply stimulus deltas scaled by volatility
+      3. Clamp to valid ranges
+      4. Detect and log trigger events
+    rationale: >
+      Decaying after stimulus would erase the impact of the latest message.
+
+  - id: EMO-002
+    title: Decay function
+    priority: MUST
+    formula: |
+      new_value = baseline + (current - baseline) * (1 - decay_rate) ** turns_elapsed
+    constraints:
+      - turns_elapsed defaults to 1 per turn.
+      - Decay applied independently to valence, arousal, dominance.
+
+  - id: EMO-003
+    title: Stimulus application
+    priority: MUST
+    formula: |
+      new_value = current + (delta * personality.emotional_volatility)
+    constraints:
+      - Deltas come from intent_mood_analyzer.
+      - Applied after decay, before clamping.
+
+  - id: EMO-004
+    title: Mood-to-description translation
+    priority: MUST
+    description: >
+      Numeric mood MUST be translated to a natural-language description
+      before being injected into any LLM system prompt. Raw numbers MUST
+      NOT be passed to the LLM.
+    acceptance:
+      - mood_to_description() returns a short string (under 50 words).
+      - Translation covers at least 6 distinct regions of the PAD space.
+
+  - id: EMO-005
+    title: Protection against runaway negative states
+    priority: SHOULD
+    description: >
+      Valence MUST NOT remain below -0.7 for more than N consecutive turns
+      (default N=5). When this floor is hit, decay_rate is temporarily
+      doubled until valence recovers above -0.5.
+    rationale: >
+      Realistic sulking is annoying in production bots; users disengage.
+
+  - id: EMO-006
+    title: User-visible state
+    priority: MUST
+    description: >
+      Numeric emotional state MUST NOT be exposed to the user in normal
+      output. State influences output indirectly via prompt and humanizer.
+    acceptance:
+      - No raw float values appear in final_response.
+      - Debug logs MAY include state but are not user-facing.
+
+  - id: EMO-007
+    title: Topic-scoped vs global state separation
+    priority: SHOULD
+    description: >
+      Mood (valence, arousal, dominance) is global to the conversation.
+      Confidence and engagement are scoped to the current topic and reset
+      on topic change.
+    acceptance:
+      - Topic change detected via embedding similarity threshold (default 0.6).
+      - On topic change, topic_state.confidence and engagement reset to
+        defaults; bot_mood is preserved.
+
+# =============================================================================
+# HUMANIZER REQUIREMENTS
+# =============================================================================
+humanizer_requirements:
+
+  - id: HUM-001
+    title: Disfluency injection
+    priority: SHOULD
+    types:
+      - fillers: ["um", "uh", "like", "you know"]
+      - hedges: ["I think", "maybe", "kind of", "sort of", "I guess"]
+      - fragments: trailing "...", mid-sentence dashes "—"
+      - self_corrections: "teh — the", "wait, I mean..."
+      - exclamations: "!", "oh!", "wait —"
+    rules:
+      - Frequency scales with personality.expressiveness.
+      - High arousal increases exclamations and fragments.
+      - Low valence increases trailing "..." and shorter sentences.
+      - Low dominance / low confidence increases hedges.
+      - Disfluencies MUST NOT alter factual content.
+
+  - id: HUM-002
+    title: Configurable intensity
+    priority: MUST
+    description: >
+      A global humanizer_intensity multiplier (0.0 to 1.0) MUST be
+      configurable at runtime to disable or scale humanization without
+      code changes.
+
+  - id: HUM-003
+    title: Determinism for testing
+    priority: SHOULD
+    description: >
+      Humanizer MUST accept an optional random seed parameter so that
+      tests can produce reproducible outputs.
+
+# =============================================================================
+# PERSONA REQUIREMENTS
+# =============================================================================
+persona_requirements:
+
+  - id: PER-001
+    title: Persona storage in config
+    priority: MUST
+    description: >
+      All personas MUST be defined under a top-level personas key in
+      config.yaml. Each entry is a named PersonaConfig (see STATE-006).
+      No persona data is hardcoded in application logic.
+    config_schema:
+      personas:
+        type: list[PersonaConfig]
+        description: >
+          Ordered list of persona definitions. The first entry is used
+          when no --persona flag is supplied.
+        item_keys: [name, gender, emotional_distance, warmth, sexuality,
+                    playfulness]
+    acceptance:
+      - config.yaml ships with at least two example personas.
+      - Adding a new persona requires only a config.yaml edit.
+
+  - id: PER-002
+    title: Persona selection via CLI
+    priority: MUST
+    description: >
+      The active persona is selected by passing --persona <name> to
+      main.py. The name is matched case-insensitively against the name
+      field of each entry in config.personas.
+    acceptance:
+      - Omitting --persona selects the first persona in the list.
+      - An unknown persona name exits immediately with a clear error and
+        lists all available persona names.
+      - The selected persona name is shown at session start so the user
+        knows which persona is active.
+
+  - id: PER-003
+    title: Persona injection into response generation
+    priority: MUST
+    description: >
+      The active persona MUST influence NODE-006 (response_generator)
+      via a natural-language description produced by persona_to_description().
+      Raw field values (floats, enum strings) MUST NOT appear in any
+      LLM system prompt.
+    acceptance:
+      - persona_to_description() returns a string under 80 words covering
+        all six PersonaConfig fields in natural language.
+      - The description is included in the NODE-006 system prompt on every
+        turn.
+      - PersonaConfig is listed as an input to NODE-006.
+
+  - id: PER-004
+    title: Persona immutability
+    priority: MUST
+    description: >
+      The active_persona field in state MUST be set once at session start
+      and treated as read-only for the entire conversation.
+    acceptance:
+      - No node other than NODE-001 (input_receiver, during init) writes
+        to active_persona.
+      - Persona cannot be changed mid-session via user input.
+
+# =============================================================================
+# PACING REQUIREMENTS
+# =============================================================================
+pacing_requirements:
+
+  - id: PACE-001
+    title: Chunked delivery
+    priority: SHOULD
+    description: >
+      Responses SHOULD be streamed in chunks separated by short delays
+      that vary with mood and content length.
+    acceptance:
+      - Short emotional replies stream within 1s total.
+      - Long reflective replies include typing-indicator pauses.
+      - Max single-chunk delay is configurable (default 4s).
+
+  - id: PACE-002
+    title: Bypass for non-chat surfaces
+    priority: MUST
+    description: >
+      Pacing MUST be disableable via config for API consumers that need
+      the full response at once.
+
+# =============================================================================
+# MEMORY REQUIREMENTS
+# =============================================================================
+memory_requirements:
+
+  - id: MEM-001
+    title: Short-term buffer
+    priority: MUST
+    description: >
+      Last N turns (default 20) MUST be retained in full.
+
+  - id: MEM-002
+    title: Long-term memory
+    priority: SHOULD
+    description: >
+      Older turns SHOULD be summarized and embedded for vector retrieval.
+      The vector store MUST be Qdrant configured in local-directory mode
+      (on-disk persistence via qdrant_client.QdrantClient(path=...)),
+      not a remote server. No Docker or network dependency is required.
+    acceptance:
+      - Retrieval returns top-k relevant past summaries (default k=3).
+      - Embedding model is pluggable.
+      - Qdrant collection is stored under a configurable local path
+        (default: .qdrant/ relative to the working directory).
+      - On first run the collection is created automatically if it does
+        not exist; subsequent runs reuse the existing collection.
+      - Qdrant client is initialised with QdrantClient(path=<local_path>),
+        never with url= or host= parameters.
+
+  - id: MEM-003
+    title: Persona memory
+    priority: MUST
+    description: >
+      First-person claims by the bot ("I prefer X", "I'm bad at Y") MUST
+      be extracted and stored as persona facts, retrieved each turn to
+      maintain self-consistency.
+
+  - id: MEM-004
+    title: Emotional event log
+    priority: SHOULD
+    description: >
+      Significant emotional shifts MUST be retrievable so the bot can
+      reference past mood-affecting events ("you mentioned earlier that...").
+
+# =============================================================================
+# NON-FUNCTIONAL REQUIREMENTS
+# =============================================================================
+non_functional:
+
+  - id: NFR-001
+    title: Latency budget
+    priority: MUST
+    description: >
+      First chunk of response MUST be delivered within 2 seconds p95
+      under normal load.
+    sub_budgets:
+      retrieval: 500ms
+      intent_analysis: 600ms
+      generation_first_token: 900ms
+
+  - id: NFR-002
+    title: Model tiering
+    priority: SHOULD
+    description: >
+      Lightweight tasks (intent classification, impact estimation,
+      humanizer-adjacent decisions) SHOULD use a small fast model.
+      Main generation uses a larger model.
+
+  - id: NFR-003
+    title: Determinism for tests
+    priority: MUST
+    description: >
+      All non-LLM components (router, decay, clamping, humanizer with seed)
+      MUST be deterministic and unit-testable without network calls.
+
+  - id: NFR-004
+    title: Observability
+    priority: SHOULD
+    description: >
+      Each turn MUST emit a structured log including mode selected,
+      mood before/after, deltas applied, latency per node.
+
+  - id: NFR-005
+    title: Graceful degradation
+    priority: MUST
+    description: >
+      Failure of optional nodes (humanizer, pacing, long-term retrieval)
+      MUST NOT block response delivery. System falls back to plain output.
+
+  - id: NFR-006
+    title: Configuration
+    priority: MUST
+    description: >
+      All tunable parameters (decay rates, thresholds, mode definitions,
+      humanizer intensity) MUST be loadable from config, not hardcoded.
+    format: YAML
+    default_path: config.yaml
+    acceptance:
+      - Configuration is read from a YAML file at a path resolved in this
+        order: --config CLI flag, then CONFIG_PATH env var, then
+        config.yaml in the working directory.
+      - The file is parsed with a strict schema; unrecognised keys raise
+        an error at startup, not silently ignored.
+      - A config.yaml with all defaults is included in the repository so
+        the application runs without a user-supplied config file.
+
+  - id: NFR-007
+    title: LLM provider configuration
+    priority: MUST
+    description: >
+      Every LangGraph node that calls an LLM (NODE-003, NODE-006, and any
+      future nodes) MUST resolve its model through a shared provider
+      abstraction configured in config.yaml. Two providers MUST be
+      supported: Ollama (local server) and OpenAI API. The active provider
+      and per-node model names are selected entirely via config; no provider
+      or model string is hardcoded in node logic.
+    config_schema:
+      llm:
+        provider:
+          type: string
+          enum: [ollama, openai]
+          description: Active provider for all LLM calls.
+        ollama:
+          base_url:
+            type: string
+            default: "http://localhost:11434"
+        openai:
+          api_key_env:
+            type: string
+            default: OPENAI_API_KEY
+            description: Name of the env var holding the API key.
+        models:
+          intent_analyzer:
+            type: string
+            description: Model used by NODE-003. Maps to the 'small' tier.
+            example_ollama: "llama3.2:3b"
+            example_openai: "gpt-4o-mini"
+          response_generator:
+            type: string
+            description: Model used by NODE-006. Maps to the 'medium' tier.
+            example_ollama: "llama3.1:8b"
+            example_openai: "gpt-4o"
+    acceptance:
+      - Switching provider requires only a config change; no code change.
+      - Each node retrieves its model name from config via the shared
+        abstraction; direct instantiation of provider clients inside
+        node logic is prohibited.
+      - On startup the application validates that the configured provider
+        is reachable (Ollama base_url ping, or OpenAI API key present)
+        and exits with a clear error if not.
+      - The default config.yaml ships with provider: ollama so the
+        application works without any API key out of the box.
+
+  - id: NFR-008
+    title: Packaging via pyproject.toml
+    priority: MUST
+    description: >
+      The project MUST be packaged using a pyproject.toml file at the
+      repository root, with all build and dependency metadata declared
+      there. No setup.py or setup.cfg.
+    acceptance:
+      - pyproject.toml declares [project] metadata: name, version,
+        description, requires-python (>=3.10), and dependencies.
+      - All runtime dependencies are listed under [project.dependencies].
+      - Dev/test dependencies are listed under
+        [project.optional-dependencies] with a key of "dev".
+      - A [project.scripts] entry maps the bot console script to
+        main:main so the bot can be launched as a command after install.
+      - Build backend is declared under [build-system]
+        (e.g. hatchling, flit-core, or setuptools).
+      - Running `pip install -e ".[dev]"` from the repo root installs
+        the package and all dev dependencies without error.
+
+# =============================================================================
+# OUT OF SCOPE
+# =============================================================================
+out_of_scope:
+  - Voice synthesis / TTS pacing (text-only initially).
+  - Multi-user group conversations.
+  - Cross-conversation personality drift / learning.
+  - Fine-tuning custom models for emotional response.
+
+# =============================================================================
+# OPEN QUESTIONS
+# =============================================================================
+open_questions:
+  - q: Should personality drift slightly across very long conversations?
+    note: Realistic but risks consistency. Default no.
+  - q: How to handle multi-language disfluencies in the humanizer?
+    note: Initial implementation English-only.
+  - q: Should the bot ever explicitly state its mood if asked?
+    note: Yes, but in natural language, never numeric.

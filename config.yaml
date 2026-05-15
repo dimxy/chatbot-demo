@@ -1,0 +1,43 @@
+llm:
+  provider: ollama
+  ollama:
+    base_url: "http://localhost:11434"
+  openai:
+    api_key_env: OPENAI_API_KEY
+  models:
+    intent_analyzer: "llama3.2:3b"
+    response_generator: "llama3.1:8b"
+
+memory:
+  short_term_turns: 20
+  long_term_top_k: 3
+  qdrant_path: ".qdrant"
+
+pacing:
+  enabled: true
+  max_chunk_delay: 4.0
+
+humanizer:
+  intensity: 0.7
+
+personality:
+  baseline_valence: 0.1
+  baseline_arousal: 0.3
+  baseline_dominance: 0.0
+  emotional_volatility: 0.5
+  decay_rate: 0.2
+  expressiveness: 0.6
+
+personas:
+  - name: Alex
+    gender: non-binary
+    emotional_distance: 0.3
+    warmth: 0.7
+    sexuality: interested
+    playfulness: 0.6
+  - name: Morgan
+    gender: female
+    emotional_distance: 0.6
+    warmth: 0.4
+    sexuality: distracted
+    playfulness: 0.3
